@@ -508,7 +508,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
-    let state_db = codex_core::init_state_db(&config).await;
+    let state_db = if config.ephemeral {
+        None
+    } else {
+        codex_core::init_state_db(&config).await
+    };
     let in_process_start_args = InProcessClientStartArgs {
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),

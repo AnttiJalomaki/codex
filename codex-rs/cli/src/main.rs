@@ -35,6 +35,7 @@ use codex_tui::UpdateAction;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
@@ -728,6 +729,21 @@ struct FeatureSetArgs {
     feature: String,
 }
 
+#[derive(Debug, Parser)]
+struct ExecFastPathCli {
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    #[clap(flatten)]
+    feature_toggles: FeatureToggles,
+
+    #[clap(flatten)]
+    remote: InteractiveRemoteOptions,
+
+    #[clap(flatten)]
+    inner: ExecCli,
+}
+
 const REMOTE_CONTROL_FEATURE_OVERRIDE: &str = "features.remote_control=true";
 
 fn enable_remote_control_for_invocation(config_overrides: &mut CliConfigOverrides) {
@@ -754,6 +770,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    if try_run_exec_fast_path(arg0_paths.clone()).await? {
+        return Ok(());
+    }
+
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
@@ -1289,6 +1309,55 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn try_run_exec_fast_path(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<bool> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if !should_try_exec_fast_path(&args) {
+        return Ok(false);
+    }
+
+    let ExecFastPathCli {
+        mut config_overrides,
+        feature_toggles,
+        remote,
+        mut inner,
+    } = match ExecFastPathCli::try_parse_from(exec_fast_path_args(args)) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
+
+    reject_remote_mode_for_subcommand(
+        remote.remote.as_deref(),
+        remote.remote_auth_token_env.as_deref(),
+        "exec",
+    )?;
+    config_overrides
+        .raw_overrides
+        .extend(feature_toggles.to_overrides()?);
+    prepend_config_flags(&mut inner.config_overrides, config_overrides);
+    codex_exec::run_main(inner, arg0_paths).await?;
+    Ok(true)
+}
+
+fn should_try_exec_fast_path(args: &[OsString]) -> bool {
+    if !matches!(args.get(1).and_then(|arg| arg.to_str()), Some("exec" | "e")) {
+        return false;
+    }
+
+    !args
+        .iter()
+        .skip(2)
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+}
+
+fn exec_fast_path_args(args: Vec<OsString>) -> Vec<OsString> {
+    let mut fast_args = Vec::with_capacity(args.len().saturating_sub(1));
+    if let Some(program) = args.first() {
+        fast_args.push(program.clone());
+    }
+    fast_args.extend(args.into_iter().skip(2));
+    fast_args
+}
+
 async fn run_exec_server_command(
     cmd: ExecServerCommand,
     arg0_paths: &Arg0DispatchPaths,
@@ -1739,6 +1808,57 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
+    use std::ffi::OsString;
+
+    #[test]
+    fn exec_fast_path_strips_exec_subcommand() {
+        let args = ["codex", "exec", "--ephemeral", "hello"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let fast_args = exec_fast_path_args(args);
+        assert_eq!(
+            fast_args,
+            ["codex", "--ephemeral", "hello"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn exec_fast_path_parses_feature_toggles_and_exec_args() {
+        let cli = ExecFastPathCli::try_parse_from([
+            "codex",
+            "--ephemeral",
+            "--disable",
+            "apps",
+            "-c",
+            "mcp_servers={}",
+            "-m",
+            "gpt-5.4-mini",
+            "hello",
+        ])
+        .expect("parse exec fast path");
+
+        assert!(cli.inner.ephemeral);
+        assert_eq!(cli.inner.prompt.as_deref(), Some("hello"));
+        assert_eq!(cli.inner.shared.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(cli.feature_toggles.disable, vec!["apps"]);
+        assert_eq!(
+            cli.config_overrides.raw_overrides,
+            vec!["mcp_servers={}".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_fast_path_leaves_help_on_full_cli_path() {
+        let args = ["codex", "exec", "--help"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!should_try_exec_fast_path(&args));
+    }
 
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");

@@ -334,6 +334,15 @@ pub(crate) struct AppServerClientMetadata {
 }
 
 impl Session {
+    fn config_may_enable_runtime_mcp(config: &Config) -> bool {
+        !config.mcp_servers.is_empty()
+            || config.features.enabled(Feature::Apps)
+            || config.features.enabled(Feature::Plugins)
+            || (config.features.enabled(Feature::BuiltInMcp)
+                && config.features.enabled(Feature::MemoryTool)
+                && config.memories.use_memories)
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.conversation_id
@@ -487,8 +496,12 @@ impl Session {
         let auth_manager_clone = Arc::clone(&auth_manager);
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
+        let may_enable_runtime_mcp = Self::config_may_enable_runtime_mcp(config_for_mcp.as_ref());
         let auth_and_mcp_fut = async move {
             let auth = auth_manager_clone.auth().await;
+            if !may_enable_runtime_mcp {
+                return (auth, HashMap::new(), HashMap::new());
+            }
             let mcp_servers = mcp_manager_for_mcp
                 .effective_servers(&config_for_mcp, auth.as_ref())
                 .await;
@@ -696,7 +709,15 @@ impl Session {
                 shell::default_user_shell()
             };
             // Create the mutable state for the Session.
-            let shell_snapshot_tx = if config.features.enabled(Feature::ShellSnapshot) {
+            // Non-interactive exec calls that disable the model shell tool do not
+            // need to spawn login shells just to snapshot an environment that no
+            // model-visible tool can use.
+            let shell_snapshot_enabled = config.features.enabled(Feature::ShellSnapshot)
+                && !(
+                    matches!(&session_configuration.session_source, SessionSource::Exec)
+                        && !config.features.enabled(Feature::ShellTool)
+                );
+            let shell_snapshot_tx = if shell_snapshot_enabled {
                 if let Some(snapshot) = session_configuration.inherited_shell_snapshot.clone() {
                     let (tx, rx) = watch::channel(Some(snapshot));
                     default_shell.shell_snapshot = rx;
@@ -943,98 +964,113 @@ impl Session {
             let enabled_mcp_server_count =
                 mcp_servers.values().filter(|server| server.enabled()).count();
             let required_mcp_server_count = required_mcp_servers.len();
-            let tool_plugin_provenance = mcp_manager.tool_plugin_provenance(config.as_ref()).await;
             let host_owned_codex_apps_enabled = config
                 .features
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(|auth| auth.uses_codex_backend()));
-            {
-                let mut cancel_guard = sess.services.mcp_startup_cancellation_token.lock().await;
-                cancel_guard.cancel();
-                *cancel_guard = CancellationToken::new();
-            }
-            let turn_environment = crate::environment_selection::resolve_environment_selections(
-                sess.services.environment_manager.as_ref(),
-                &session_configuration.environments,
-            )
-            .map_err(|err| {
-                CodexErr::InvalidRequest(err.to_string().replace(
-                    "unknown turn environment id",
-                    "unknown stored MCP environment id",
-                ))
-            })?
-            .primary()
-            .cloned();
-            let mcp_runtime_environment = match turn_environment {
-                Some(turn_environment) => McpRuntimeEnvironment::new(
-                    Arc::clone(&turn_environment.environment),
-                    turn_environment.cwd.to_path_buf(),
-                ),
-                None => McpRuntimeEnvironment::new(
-                    sess.services
-                        .environment_manager
-                        .default_environment()
-                        .unwrap_or_else(|| sess.services.environment_manager.local_environment()),
-                    session_configuration.cwd.to_path_buf(),
-                ),
-            };
-            let (mcp_connection_manager, cancel_token) = McpConnectionManager::new(
-                &mcp_servers,
-                config.mcp_oauth_credentials_store_mode,
-                auth_statuses.clone(),
-                &session_configuration.approval_policy,
-                INITIAL_SUBMIT_ID.to_owned(),
-                tx_event.clone(),
-                session_configuration.permission_profile(),
-                mcp_runtime_environment,
-                config.codex_home.to_path_buf(),
-                codex_apps_tools_cache_key(auth),
-                host_owned_codex_apps_enabled,
-                tool_plugin_provenance,
-                auth,
-                Some(sess.mcp_elicitation_reviewer()),
-            )
-            .instrument(info_span!(
-                "session_init.mcp_manager_init",
-                otel.name = "session_init.mcp_manager_init",
-                session_init.enabled_mcp_server_count = enabled_mcp_server_count,
-                session_init.required_mcp_server_count = required_mcp_server_count,
-            ))
-            .await;
-            {
-                let mut manager_guard = sess.services.mcp_connection_manager.write().await;
-                *manager_guard = mcp_connection_manager;
-            }
-            {
-                let mut cancel_guard = sess.services.mcp_startup_cancellation_token.lock().await;
-                if cancel_guard.is_cancelled() {
-                    cancel_token.cancel();
+            let skip_mcp_runtime =
+                matches!(&session_configuration.session_source, SessionSource::Exec)
+                    && enabled_mcp_server_count == 0;
+            if !skip_mcp_runtime {
+                let tool_plugin_provenance = if mcp_servers.is_empty() {
+                    Default::default()
+                } else {
+                    mcp_manager.tool_plugin_provenance(config.as_ref()).await
+                };
+                {
+                    let mut cancel_guard =
+                        sess.services.mcp_startup_cancellation_token.lock().await;
+                    cancel_guard.cancel();
+                    *cancel_guard = CancellationToken::new();
                 }
-                *cancel_guard = cancel_token;
-            }
-            if !required_mcp_servers.is_empty() {
-                let failures = sess
-                    .services
-                    .mcp_connection_manager
-                    .read()
-                    .await
-                    .required_startup_failures(&required_mcp_servers)
-                    .instrument(info_span!(
-                        "session_init.required_mcp_wait",
-                        otel.name = "session_init.required_mcp_wait",
-                        session_init.required_mcp_server_count = required_mcp_server_count,
+                let turn_environment = crate::environment_selection::resolve_environment_selections(
+                    sess.services.environment_manager.as_ref(),
+                    &session_configuration.environments,
+                )
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(err.to_string().replace(
+                        "unknown turn environment id",
+                        "unknown stored MCP environment id",
                     ))
-                    .await;
-                if !failures.is_empty() {
-                    let details = failures
-                        .iter()
-                        .map(|failure| format!("{}: {}", failure.server, failure.error))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    anyhow::bail!("required MCP servers failed to initialize: {details}");
+                })?
+                .primary()
+                .cloned();
+                let mcp_runtime_environment = match turn_environment {
+                    Some(turn_environment) => McpRuntimeEnvironment::new(
+                        Arc::clone(&turn_environment.environment),
+                        turn_environment.cwd.to_path_buf(),
+                    ),
+                    None => McpRuntimeEnvironment::new(
+                        sess.services
+                            .environment_manager
+                            .default_environment()
+                            .unwrap_or_else(|| {
+                                sess.services.environment_manager.local_environment()
+                            }),
+                        session_configuration.cwd.to_path_buf(),
+                    ),
+                };
+                let (mcp_connection_manager, cancel_token) = McpConnectionManager::new(
+                    &mcp_servers,
+                    config.mcp_oauth_credentials_store_mode,
+                    auth_statuses.clone(),
+                    &session_configuration.approval_policy,
+                    INITIAL_SUBMIT_ID.to_owned(),
+                    tx_event.clone(),
+                    session_configuration.permission_profile(),
+                    mcp_runtime_environment,
+                    config.codex_home.to_path_buf(),
+                    codex_apps_tools_cache_key(auth),
+                    host_owned_codex_apps_enabled,
+                    tool_plugin_provenance,
+                    auth,
+                    Some(sess.mcp_elicitation_reviewer()),
+                )
+                .instrument(info_span!(
+                    "session_init.mcp_manager_init",
+                    otel.name = "session_init.mcp_manager_init",
+                    session_init.enabled_mcp_server_count = enabled_mcp_server_count,
+                    session_init.required_mcp_server_count = required_mcp_server_count,
+                ))
+                .await;
+                {
+                    let mut manager_guard = sess.services.mcp_connection_manager.write().await;
+                    *manager_guard = mcp_connection_manager;
+                }
+                {
+                    let mut cancel_guard =
+                        sess.services.mcp_startup_cancellation_token.lock().await;
+                    if cancel_guard.is_cancelled() {
+                        cancel_token.cancel();
+                    }
+                    *cancel_guard = cancel_token;
+                }
+                if !required_mcp_servers.is_empty() {
+                    let failures = sess
+                        .services
+                        .mcp_connection_manager
+                        .read()
+                        .await
+                        .required_startup_failures(&required_mcp_servers)
+                        .instrument(info_span!(
+                            "session_init.required_mcp_wait",
+                            otel.name = "session_init.required_mcp_wait",
+                            session_init.required_mcp_server_count = required_mcp_server_count,
+                        ))
+                        .await;
+                    if !failures.is_empty() {
+                        let details = failures
+                            .iter()
+                            .map(|failure| format!("{}: {}", failure.server, failure.error))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        anyhow::bail!("required MCP servers failed to initialize: {details}");
+                    }
                 }
             }
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-                .await;
+            if !matches!(&session_configuration.session_source, SessionSource::Exec) {
+                sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+                    .await;
+            }
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
                 InitialHistory::New | InitialHistory::Forked(_) => {

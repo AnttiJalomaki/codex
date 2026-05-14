@@ -44,10 +44,15 @@ fn does_not_persist_rollout_file_in_ephemeral_mode() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .arg("--skip-git-repo-check")
         .arg("--ephemeral")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
         .arg("ephemeral behavior")
         .assert()
         .code(0);
 
     assert_eq!(session_rollout_count(test.home_path()), 0);
+    assert!(!test.home_path().join("config.toml").exists());
+    assert!(!test.home_path().join("installation_id").exists());
+    assert!(!test.home_path().join("state_5.sqlite").exists());
+    assert!(!test.home_path().join("logs_2.sqlite").exists());
     Ok(())
 }
