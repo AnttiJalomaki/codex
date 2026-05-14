@@ -54,6 +54,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_config::CloudRequirementsLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
@@ -356,13 +357,25 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
-    let cloud_requirements = cloud_requirements_loader_for_storage(
-        codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        config_toml.cli_auth_credentials_store.unwrap_or_default(),
-        chatgpt_base_url,
-    )
-    .await;
+    //
+    // Ephemeral exec invocations have no persistent storage to gate, and the
+    // shared-future loader spawns an `AuthManager::shared` load + two
+    // `tokio::spawn` tasks (fetch + background refresh) even when the
+    // resulting auth is ineligible for cloud requirements. Skipping the
+    // loader entirely is a measurable cold-start win and `default()` yields
+    // `Ok(None)`, which is the same value the eligibility path produces for
+    // OCC-style callers.
+    let cloud_requirements = if ephemeral {
+        CloudRequirementsLoader::default()
+    } else {
+        cloud_requirements_loader_for_storage(
+            codex_home.to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            config_toml.cli_auth_credentials_store.unwrap_or_default(),
+            chatgpt_base_url,
+        )
+        .await
+    };
     let run_cli_overrides = cli_kv_overrides.clone();
     let run_loader_overrides = loader_overrides.clone();
     let run_cloud_requirements = cloud_requirements.clone();
@@ -461,22 +474,32 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         std::process::exit(1);
     }
 
-    let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        codex_core::otel_init::build_provider(
-            &config,
-            env!("CARGO_PKG_VERSION"),
-            /*service_name_override*/ None,
-            DEFAULT_ANALYTICS_ENABLED,
-        )
-    })) {
-        Ok(Ok(otel)) => otel,
-        Ok(Err(e)) => {
-            eprintln!("Could not create otel exporter: {e}");
-            None
-        }
-        Err(_) => {
-            eprintln!("Could not create otel exporter: panicked during initialization");
-            None
+    // Ephemeral exec invocations are headless and short-lived; building the
+    // OTLP HTTP exporter, periodic meter export task, and tracestate
+    // propagator is pure cold-start cost when nothing downstream observes the
+    // telemetry. Operators who still want OTel from ephemeral exec can opt in
+    // via `CODEX_OTEL_FORCE=1`.
+    let otel_force = std::env::var_os("CODEX_OTEL_FORCE").is_some();
+    let otel = if ephemeral && !otel_force {
+        None
+    } else {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            codex_core::otel_init::build_provider(
+                &config,
+                env!("CARGO_PKG_VERSION"),
+                /*service_name_override*/ None,
+                DEFAULT_ANALYTICS_ENABLED,
+            )
+        })) {
+            Ok(Ok(otel)) => otel,
+            Ok(Err(e)) => {
+                eprintln!("Could not create otel exporter: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Could not create otel exporter: panicked during initialization");
+                None
+            }
         }
     };
 
